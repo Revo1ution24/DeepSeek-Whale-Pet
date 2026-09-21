@@ -22,13 +22,20 @@ html, body {
   --wp-scale: 1;
   --wp-base: 320px;
   --wp-u: calc(var(--wp-base) / 1026);
+  /* 统一不透明度出口：所有淡化条件（闲置/忙碌/悬停/拖拽…）汇总到这一个变量，
+     作用于整棵子树。opacity 会在父元素上形成合成组，子元素无法突破其上限 ——
+     凡是要一起淡的都留在 .wp-root 内，需要豁免的必须移到 .wp-root 之外。 */
+  --wp-opacity: 1;
   width: var(--wp-base);
   height: var(--wp-base);
   pointer-events: none;
   z-index: 9999;
   transform: none;
-  transition: transform .3s ease;
+  opacity: var(--wp-opacity);
+  transition: transform .3s ease, opacity .4s ease;
 }
+/* 恢复方向要快：凑近看时鲸鱼应立刻可见，变淡则可以慢 */
+.wp-root.wp-op-fast { transition: transform .3s ease, opacity .12s ease; }
 .wp-root.wp-dragging { cursor: grabbing; transition: none; }
 /* 方向感知锚点：窗口位于屏幕左半侧时整体镜像（鲸鱼贴左缘，可触左边缘） */
 .wp-root.wp-left { transform: scaleX(-1); }
@@ -58,11 +65,8 @@ html, body {
   width: 100%;
   height: 100%;
   transform-origin: 50% 100%;
-  transition: transform .22s cubic-bezier(.34, 1.56, .64, 1), opacity .4s ease;
+  transition: transform .22s cubic-bezier(.34, 1.56, .64, 1);
 }
-.wp-root.wp-dragging .wp-body { transition: transform .22s cubic-bezier(.34, 1.56, .64, 1); }
-/* 闲置半透明（鼠标离开 3s 后渐隐到可调阈值，默认 0.6） */
-.wp-root.wp-idle .wp-body { opacity: var(--wp-idle-opacity, .6); }
 
 .wp-img {
   position: absolute;
@@ -74,7 +78,57 @@ html, body {
   pointer-events: none;
   -webkit-user-drag: none;
   user-select: none;
+  /* 朝光标轻微倾斜（--wp-tilt-* 由 pet.js 的 updatePose 每拍写入）：
+     位移单位是 --wp-u，而 --wp-u = base/1026 恰好等于**源图上的一个像素**
+     （图片宽 0.5945×base、源图 610px → 1026 = 610/0.5945），所以下面的位移
+     数值可以直接按源图像素来读，不用再换算。
+     transform-origin 落在底边中点 —— 绕「脚下」而不是绕图片中心转才像人往旁边探身。
+     过渡负责把 20Hz 的离散光标采样抹成连续运动，跟随因此有黏滞感但不迟钝。 */
+  transform-origin: 50% 100%;
+  transform: translate(calc(var(--wp-u) * var(--wp-tilt-x, 0)), calc(var(--wp-u) * var(--wp-tilt-y, 0)))
+             rotate(calc(var(--wp-tilt-r, 0) * 1deg));
+  transition: transform .18s ease-out;
 }
+
+/* 瞳孔跟随层（--wp-gaze-* 由 updatePose 写入）。
+   DOM 上排在主图**前面**，所以绘制在主图之下 —— 这是整套方案的关键：
+   虹膜平移时，前缘滑进主图（已挖掉眼内，其余处处不透明）被整块挡掉，
+   后缘让出的空档露出本层自己的暗色延伸，读作眼窝内阴影而不是一个洞。
+   因此可动范围不受眼眶粗细限制，也不必扩展虹膜、不必做裁剪遮罩。
+   transform 与倾斜合成同一条：虹膜要跟着身体一起歪，坐标系里再叠加自己的平移。
+   两者都是平移，先后次序只差 2° 旋转带来的零点几像素，忽略。
+   transition 有意不重写 —— 与主图同为 .18s，两层才不会在跟随中分离。
+   transform-origin 也**必须**沿用 .wp-img 的底边中点，不能另写：这一层带着倾斜的
+   rotate，旋转中心一不同，倾斜时虹膜就会相对脸漂移（2.2° 下约 1 CSS px，看得见）。 */
+.wp-img-gaze {
+  transform: translate(calc(var(--wp-u) * (var(--wp-tilt-x, 0) + var(--wp-gaze-x, 0))),
+                       calc(var(--wp-u) * (var(--wp-tilt-y, 0) + var(--wp-gaze-y, 0))))
+             rotate(calc(var(--wp-tilt-r, 0) * 1deg));
+}
+/* 眼部效果关闭（自定义主图 / 预警图）时整层拿掉。主图不透明处本来就会盖住它，
+   但自定义图未必处处不透明，隐式依赖太脆，直接不显示。 */
+.wp-root:not(.wp-eye-fx) .wp-img-gaze { display: none; }
+
+/* 闭眼帧：与主图同尺寸同定位（复用上面的定位规则），叠加后靠不透明度切换。
+   过渡要短 —— 一次眨眼闭合不到 100ms，再慢就看不出是「眨」而是「化」了。 */
+.wp-img-lid {
+  opacity: 0;
+  /* transform 的过渡必须重复声明：本条与 .wp-img 同优先级且在其后，
+     只写 opacity 会把上面那条 transform 过渡整个覆盖掉 —— 眨眼瞬间两层
+     的倾斜进度就会不同步，光标在动时看得出错位。 */
+  transition: transform .18s ease-out, opacity .06s linear;
+}
+.wp-img-lid.wp-lid-on { opacity: 1; }
+
+/* Live2D 模型画布（live2d-view.js 挂载、pet.js 切 .wp-l2d）：
+   与主图同尺寸同定位（复用 .wp-img 的 right/bottom/宽高规则）。
+   主图 img 保留布局盒（命中测试、鱼矩形、缩放都以它为基准），只把画面隐掉；
+   PNG 虹膜层与闭眼帧在模型模式下整层拿掉（模型自己做眨眼/眼追）。 */
+.wp-img-l2d { display: none; }
+.wp-root.wp-l2d .wp-img-l2d { display: block; }
+.wp-root.wp-l2d img.wp-img { opacity: 0; }
+.wp-root.wp-l2d .wp-img-gaze { display: none; }
+.wp-root.wp-l2d .wp-img-lid { display: none; }
 
 /* 预警徽标（预警换图开启且余额低于阈值时显示） */
 .wp-alert-badge {

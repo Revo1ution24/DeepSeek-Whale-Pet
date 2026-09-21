@@ -7,6 +7,8 @@
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
+const http = require('http')
+const { spawn } = require('child_process')
 const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, screen, Notification, nativeImage, dialog, nativeTheme, shell } = require('electron')
 
 const configMod = require('./lib/config')
@@ -78,6 +80,7 @@ function main() {
   })
   app.on('will-quit', () => {
     globalShortcut.unregisterAll()
+    if (cursorTimer) { clearInterval(cursorTimer); cursorTimer = null }
   })
 }
 
@@ -90,8 +93,11 @@ async function onReady() {
   setupTray()
   setupShortcuts()
   registerIpc()
+  startCursorPoll()
 
   if (IS_SMOKE) await runSmoke()
+  // 开发自测（仅环境变量触发，正式使用无影响）：自动跑一遍 Harness 启动流程
+  if (process.env.WHALE_HARNESS_AUTOTEST) runHarnessAutotest()
 }
 
 // ================================ 鲸鱼窗口 =================================
@@ -266,6 +272,8 @@ function rebuildTrayMenu() {
       { label: '立即刷新余额', click: () => sendRefresh() },
       { label: '打开设置', click: () => openMenu() },
       { type: 'separator' },
+      ...harnessMenuItems(),
+      { type: 'separator' },
       { label: '开机自启', type: 'checkbox', checked: !!cfg.autostart, click: (item) => setAutostart(item.checked) },
       { type: 'separator' },
       { label: '退出', click: () => app.quit() },
@@ -289,6 +297,310 @@ function broadcast(channel, payload) {
       if (w && !w.isDestroyed()) w.webContents.send(channel, payload)
     } catch (err) { /* ignore */ }
   }
+}
+
+// =========================== DeepSeek Harness ==============================
+// 便携版 Harness（`dsh web` 本地服务）的一键启动/停止，入口在托盘菜单。
+// 2026-09-19 实测背景：
+// - 首启约 23.5s（初始化建 510 个符号链接），预算给 90s；非 TTY 可跑
+// - 成功时 stdout 只有一行 `dsh web: http://127.0.0.1:3080`（重定向进日志文件）
+// - 便携版内层文件夹名可能是乱码（解压工具按错编码还原）→ 路径绝不按名字匹配，
+//   一律以 node/node.exe + app/node_modules/@deepseek-ai/dsh/lib/bin.js 两个文件
+//   是否在来认定；spawn 数组传参，绝不 shell:true（路径含空格/括号/乱码）
+// - 隐藏窗口 + 日志落盘（whale-pet 配置目录 dsh.log）；Harness 独立于鲸鱼存活，
+//   退出鲸鱼不杀它 —— 所以 child 的 stdout/stderr 直接重定向到文件而不用管道：
+//   管道读端会随鲸鱼退出关闭，dsh 之后任何一次写日志都会 EPIPE。
+const HARNESS_DEFAULT_PORT = 3080
+const HARNESS_BOOT_TIMEOUT_MS = 90 * 1000
+const HARNESS_POLL_MS = 1500
+
+// status: idle | starting | running；running 且 child 非空 = 这个实例由我们起的（可停）
+const harness = { status: 'idle', child: null, url: '', poll: null, timer: null, ticking: false }
+
+function harnessRoot() {
+  return configMod.getEffective().harnessPath || ''
+}
+
+// 校验目录。自动钻一层：用户可能选到外层「DeepSeek-Harness便携版(1)」，
+// 真正带 node/ 和 app/ 的是里面那层（名字可能是乱码）。
+function resolveHarness(dir) {
+  if (!dir) return null
+  const hit = (d) => {
+    const nodeExe = path.join(d, 'node', 'node.exe')
+    const binJs = path.join(d, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    return fs.existsSync(nodeExe) && fs.existsSync(binJs) ? { root: d, nodeExe, binJs } : null
+  }
+  try {
+    const direct = hit(dir)
+    if (direct) return direct
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue
+      const inner = hit(path.join(dir, ent.name))
+      if (inner) return inner
+    }
+  } catch (err) { /* 路径不存在等 */ }
+  return null
+}
+
+function harnessLogPath() { return path.join(configMod.CONFIG_DIR, 'dsh.log') }
+
+// 从 dsh.log 最后一段（本次启动之后）找 `dsh web: http://…`。
+// 3080 被占时 dsh 会换端口 —— 日志里这行才是端口权威，不硬编码。
+function harnessUrlFromLog() {
+  try {
+    const buf = fs.readFileSync(harnessLogPath())
+    let tail = buf.slice(Math.max(0, buf.length - 8192)).toString('utf8')
+    tail = tail.replace(/\x1b\[[0-9;]*m/g, '')
+    const cut = tail.lastIndexOf('=====')
+    if (cut >= 0) tail = tail.slice(cut)
+    const m = /dsh web:\s*(https?:\/\/\S+)/.exec(tail)
+    return m ? m[1] : ''
+  } catch (err) { return '' }
+}
+
+function probeHarnessPort(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: port || HARNESS_DEFAULT_PORT, path: '/', timeout: 900 }, (res) => {
+      res.resume()
+      resolve(true)
+    })
+    req.on('timeout', () => { req.destroy(); resolve(false) })
+    req.on('error', () => resolve(false))
+  })
+}
+
+function petNotice(text) {
+  if (petWin && !petWin.isDestroyed()) petWin.webContents.send('whale:notice', String(text || ''))
+}
+
+function clearHarnessTimers() {
+  if (harness.poll) { clearInterval(harness.poll); harness.poll = null }
+  if (harness.timer) { clearTimeout(harness.timer); harness.timer = null }
+}
+
+// 结束我们自己的子进程：taskkill 只精确到该 PID 的整棵子树，绝不按映像名杀
+function harnessKillChild() {
+  const child = harness.child
+  harness.child = null
+  if (child && child.pid) {
+    try { spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }) } catch (err) { /* ignore */ }
+  }
+}
+
+function harnessOpenPage() {
+  const url = harness.url || ('http://127.0.0.1:' + HARNESS_DEFAULT_PORT)
+  if (process.env.WHALE_HARNESS_AUTOTEST) { console.log('[harness] openExternal -> ' + url); return }
+  shell.openExternal(url)
+}
+
+function harnessMenuItems() {
+  if (harness.status === 'starting') return [{ label: 'Harness 启动中…', enabled: false }]
+  if (harness.status === 'running') {
+    const items = [{ label: '打开 Harness 页面', click: () => harnessOpenPage() }]
+    if (harness.child) items.push({ label: '停止 Harness', click: () => harnessStop() })
+    return items
+  }
+  if (!harnessRoot()) return [{ label: '选择 Harness 文件夹…', click: () => harnessPickDir(true) }]
+  return [{ label: '打开 DeepSeek Harness', click: () => harnessOpen() }]
+}
+
+// 首次使用：选一次便携版文件夹（外层里层都行），解析结果存进 config.json
+async function harnessPickDir(autoStart) {
+  try {
+    const opts = {
+      title: '选择 DeepSeek-Harness 便携版文件夹（外层 / 里层都行）',
+      buttonLabel: '用这个文件夹',
+      properties: ['openDirectory'],
+    }
+    const parent = menuWin && !menuWin.isDestroyed() && menuWin.isVisible() ? menuWin : null
+    const r = parent ? await dialog.showOpenDialog(parent, opts) : await dialog.showOpenDialog(opts)
+    if (r.canceled || !r.filePaths || !r.filePaths.length) return
+    const hit = resolveHarness(r.filePaths[0])
+    if (!hit) return petNotice('这个文件夹里没有 Harness（找不到 node/node.exe）')
+    configMod.save({ harnessPath: hit.root })
+    rebuildTrayMenu()
+    if (autoStart) harnessStart(hit)
+    else petNotice('Harness 路径已记住')
+  } catch (err) {
+    petNotice('选择文件夹失败：' + ((err && err.message) || err))
+  }
+}
+
+async function harnessOpen() {
+  if (harness.status === 'starting') return
+  if (harness.status === 'running' && harness.child) return harnessOpenPage()
+  // 先探端口：可能是用户自己双击 bat 起的 —— 在跑就直接开页面，不重复启动
+  if (await probeHarnessPort(HARNESS_DEFAULT_PORT)) {
+    harness.status = 'running'
+    harness.url = harness.url || harnessUrlFromLog() || ('http://127.0.0.1:' + HARNESS_DEFAULT_PORT)
+    rebuildTrayMenu()
+    return harnessOpenPage()
+  }
+  // 不在跑：此前记的状态已过期，走启动流程
+  harness.status = 'idle'
+  harness.url = ''
+  const root = harnessRoot()
+  if (!root) return harnessPickDir(true)
+  const hit = resolveHarness(root)
+  if (!hit) {
+    petNotice('Harness 文件夹找不到了，请重新选择')
+    return harnessPickDir(false)
+  }
+  harnessStart(hit)
+}
+
+function harnessStart(hit) {
+  harness.status = 'starting'
+  harness.url = ''
+  harness.child = null
+  rebuildTrayMenu()
+  petNotice('Harness 启动中…（首次约 25 秒）')
+
+  // 日志落盘：child 的 stdout/stderr 直接重定向到文件（不用管道，见段首注释）
+  let logFd = null
+  try {
+    const logFile = harnessLogPath()
+    try { if (fs.statSync(logFile).size > 1024 * 1024) fs.truncateSync(logFile) } catch (err) { /* 不存在等 */ }
+    logFd = fs.openSync(logFile, 'a')
+    fs.writeSync(logFd, '\n===== ' + new Date().toISOString() + ' dsh web @ ' + hit.root + ' =====\n')
+  } catch (err) { logFd = null }
+
+  // PATH 前置便携版 node 目录（与 启动.bat 同款）；Windows 环境变量大小写不敏感，
+  // 先删掉原大小写的 Path 键再设，避免同键两名并存
+  const env = Object.assign({}, process.env, { DSH_HOME: path.join(hit.root, 'data') })
+  for (const k of Object.keys(env)) if (k.toLowerCase() === 'path') delete env[k]
+  env.PATH = path.join(hit.root, 'node') + path.delimiter + (process.env.PATH || '')
+
+  let child
+  try {
+    child = spawn(hit.nodeExe, [hit.binJs, 'web'], {
+      cwd: hit.root,
+      env,
+      windowsHide: true,
+      // detached 必不可少：Electron（Chromium）把子进程纳入带 kill-on-close 的
+      // Job 对象，非 detached 的子进程会在鲸鱼退出时被连带杀掉（实测：不加它，
+      // 退出鲸鱼 dsh 一起死）。detached → CREATE_BREAKAWAY_FROM_JOB 脱离，
+      // 从根上兑现「Harness 独立存活」；windowsHide 保证不生窗口
+      detached: true,
+      stdio: ['ignore', logFd === null ? 'ignore' : logFd, logFd === null ? 'ignore' : logFd],
+    })
+  } catch (err) {
+    if (logFd !== null) { try { fs.closeSync(logFd) } catch (e) { /* ignore */ } }
+    harness.status = 'idle'
+    rebuildTrayMenu()
+    return petNotice('Harness 启动失败：' + ((err && err.message) || err))
+  }
+  if (logFd !== null) { try { fs.closeSync(logFd) } catch (err) { /* child 已继承自己的副本 */ } }
+  harness.child = child
+  child.unref() // detached 子进程别撑住鲸鱼的事件循环，退出各走各的
+
+  const up = () => {
+    if (harness.status !== 'starting') return
+    clearHarnessTimers()
+    harness.status = 'running'
+    harness.url = harnessUrlFromLog() || ('http://127.0.0.1:' + HARNESS_DEFAULT_PORT)
+    rebuildTrayMenu()
+    petNotice('Harness 起来了')
+    harnessOpenPage()
+  }
+
+  // 就绪判定 = 日志出现 URL 且其端口可连；日志还没刷出来时退回探默认端口。
+  const tick = async () => {
+    if (harness.status !== 'starting' || harness.ticking) return
+    harness.ticking = true
+    try {
+      const url = harnessUrlFromLog()
+      if (url) {
+        let port = HARNESS_DEFAULT_PORT
+        try { port = Number(new URL(url).port) || port } catch (err) { /* ignore */ }
+        if (await probeHarnessPort(port)) return up()
+        return
+      }
+      if (await probeHarnessPort(HARNESS_DEFAULT_PORT)) up()
+    } finally { harness.ticking = false }
+  }
+  harness.poll = setInterval(tick, HARNESS_POLL_MS)
+  tick()
+  harness.timer = setTimeout(() => {
+    if (harness.status !== 'starting') return
+    clearHarnessTimers()
+    harness.status = 'idle'
+    harnessKillChild()
+    rebuildTrayMenu()
+    petNotice('Harness 启动超时（90 秒），详见 dsh.log')
+  }, HARNESS_BOOT_TIMEOUT_MS)
+
+  child.on('exit', (code) => {
+    if (harness.child !== child) return
+    harness.child = null
+    clearHarnessTimers()
+    if (harness.status === 'starting') {
+      harness.status = 'idle'
+      harness.url = ''
+      petNotice('Harness 启动失败（退出码 ' + code + '），详见 dsh.log')
+    } else if (harness.status === 'running') {
+      harness.status = 'idle'
+      harness.url = ''
+    }
+    rebuildTrayMenu()
+  })
+}
+
+function harnessStop() {
+  clearHarnessTimers()
+  harnessKillChild()
+  harness.status = 'idle'
+  harness.url = ''
+  rebuildTrayMenu()
+  petNotice('Harness 已停止')
+}
+
+// 开发自测钩子（WHALE_HARNESS_AUTOTEST=1 = 起→停→退出；=leave = 起→退出，验独立存活）
+function runHarnessAutotest() {
+  const mode = process.env.WHALE_HARNESS_AUTOTEST
+  setTimeout(() => harnessOpen(), 3000)
+  const watcher = setInterval(() => {
+    if (harness.status !== 'running') return
+    clearInterval(watcher)
+    console.log('[harness-autotest] UP ' + harness.url)
+    setTimeout(() => {
+      if (mode !== 'leave') harnessStop()
+      setTimeout(() => { console.log('[harness-autotest] DONE'); app.quit() }, 2500)
+    }, 4000)
+  }, 1000)
+  setTimeout(() => {
+    if (harness.status !== 'running') {
+      console.log('[harness-autotest] NOT-UP status=' + harness.status)
+      app.quit()
+    }
+  }, 120000)
+}
+
+// ============================== 全局光标轮询 ===============================
+// 渲染进程只能拿到「窗口内」的指针事件（靠 setIgnoreMouseEvents 的 forward
+// 转发），拿不到窗口外的全局位置。而眼睛追踪、「忙碌」判定、悬停边界都需要
+// 全局光标，因此由主进程统一轮询后推给渲染进程 —— 一次轮询喂三个消费者。
+// 50ms(20Hz)：眼睛追踪够用；其余两个靠时间窗/几何聚合，更不需要更高频率。
+// 与 tick 同时带上窗口 bounds：边界判定要在屏幕坐标系里把「窗口内布局」换算
+// 过去，而主进程会自行移动窗口（拖拽引擎 16ms setPosition、reclampPos…），
+// 渲染进程缓存的 posX/posY 在这些时刻是旧的 —— 每拍现取才是唯一可靠来源。
+// 窗口不存在/不可见时跳过本拍，避免后台空转。
+const CURSOR_TICK_MS = 50
+let cursorTimer = null
+
+function startCursorPoll() {
+  if (cursorTimer) return
+  cursorTimer = setInterval(() => {
+    if (!petWin || petWin.isDestroyed() || !petWin.isVisible()) return
+    let pt, b
+    try {
+      pt = screen.getCursorScreenPoint()
+      b = petWin.getBounds()
+    } catch (err) { return }
+    try {
+      petWin.webContents.send('cursor:tick', { x: pt.x, y: pt.y, win: { x: b.x, y: b.y, w: b.width, h: b.height } })
+    } catch (err) { /* ignore */ }
+  }, CURSOR_TICK_MS)
 }
 
 // ================================ 热键 / 自启 ==============================
@@ -839,6 +1151,20 @@ function registerIpc() {
     configMod.save(imagePatchFor(kind))
     broadcast('config:changed', configMod.getEffective())
     return { ok: true }
+  })
+
+  // ---------- Live2D 模型资产读取（渲染进程 sandbox 无 Node，字节走这里）----------
+  // 只允许读 renderer/live2d 目录下的文件（防目录穿越），返回 Buffer（渲染进程收到 Uint8Array）
+  ipcMain.handle('l2d:read', (e, msg) => {
+    try {
+      const rel = msg && typeof msg.rel === 'string' ? msg.rel : ''
+      const l2dDir = path.join(__dirname, 'renderer', 'live2d')
+      const abs = path.resolve(l2dDir, rel)
+      if (abs !== l2dDir && !abs.startsWith(l2dDir + path.sep)) return { ok: false, error: 'forbidden' }
+      return { ok: true, data: fs.readFileSync(abs) }
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) }
+    }
   })
 
   // ---------- 自定义音效上传（复制到配置目录，与源文件解耦）----------

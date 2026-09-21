@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld('whaleAPI', {
   resetImage: (kind) => ipcRenderer.invoke('image:reset', { kind }),
   // 自定义音效（按压/松手）上传 + 恢复默认
   pickSound: (which) => ipcRenderer.invoke('sound:pick', { which }),
+  // Live2D 模型资产（只读 renderer/live2d 目录；sandbox 下渲染进程无法直接读文件）
+  readL2D: (rel) => ipcRenderer.invoke('l2d:read', { rel }),
   resetSound: (which) => ipcRenderer.invoke('sound:reset', { which }),
   // 自定义随机台词/动图（~/.config/whale-pet/lines.json，含默认池）
   getCustom: () => ipcRenderer.invoke('custom:get'),
@@ -48,8 +50,12 @@ contextBridge.exposeInMainWorld('whaleAPI', {
   closeMenu: () => ipcRenderer.send('menu:close'),
   // 用系统默认程序打开文件/目录/URL
   openPath: (path) => ipcRenderer.invoke('shell:open-path', { path }),
+  // 全局光标（主进程 20Hz 轮询推送，{x,y} 为 DIP）：眼睛追踪 + 忙碌判定共用
+  onCursorTick: (cb) => ipcRenderer.on('cursor:tick', (_e, pt) => cb(pt)),
   // 事件
   onConfigChanged: (cb) => ipcRenderer.on('config:changed', (_e, cfg) => cb(cfg)),
   onCustomChanged: (cb) => ipcRenderer.on('custom:changed', (_e, data) => cb(data)),
   onRefresh: (cb) => ipcRenderer.on('whale:refresh', () => cb()),
+  // 主进程通知（如 Harness 启动结果）→ 以气泡文案展示
+  onNotice: (cb) => ipcRenderer.on('whale:notice', (_e, text) => cb(text)),
 })

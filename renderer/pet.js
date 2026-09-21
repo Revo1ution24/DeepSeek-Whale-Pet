@@ -47,12 +47,33 @@
   img.alt = 'DeepSeek 余额'
   img.draggable = false
 
+  // 瞳孔跟随层：整张透明，只有两个眼盘 —— 外加一圈向外逐渐变暗的延伸。
+  // 排在主图**前面**（绘制在其下），开启眼部效果时主图换成「眼内挖空」的那张
+  // （GAZE_BASE_IMG），于是虹膜能露出来、又能被主图挡住前缘。见 pet.css 的注释。
+  var gazeIris = document.createElement('img')
+  gazeIris.className = 'wp-img wp-img-gaze'
+  gazeIris.src = '../assets/DSniang1-gaze-iris.png'
+  gazeIris.alt = ''
+  gazeIris.draggable = false
+  gazeIris.setAttribute('aria-hidden', 'true')
+
+  // 闭眼帧：与主图同尺寸、同定位（同一个 .wp-img 定位规则），叠在上面靠不透明度
+  // 切换。只在用内置默认主图时启用 —— 自定义图没有配套闭眼帧，见 eyeFxEnabled()。
+  var lidImg = document.createElement('img')
+  lidImg.className = 'wp-img wp-img-lid'
+  lidImg.src = '../assets/DSniang1-closed.png'
+  lidImg.alt = ''
+  lidImg.draggable = false
+  lidImg.setAttribute('aria-hidden', 'true')
+
   // 预警徽标（默认隐藏；达到预警额度且开启预警换图时显示）
   var alertBadge = document.createElement('div')
   alertBadge.className = 'wp-alert-badge'
   alertBadge.textContent = '!'
 
+  breath.appendChild(gazeIris)
   breath.appendChild(img)
+  breath.appendChild(lidImg)
   breath.appendChild(alertBadge)
 
   var bubbleBox = document.createElement('div')
@@ -120,7 +141,7 @@
   }
   var busy = false
   var refreshTimer = null
-  var idleCheckTimer = null
+  var opacityTimer = null
   var animId = null
   var shown = null
   var animDelayTimer = null
@@ -143,6 +164,59 @@
   var bubbleIntervalMs = 120000
   var bubbleIntervalTimer = null
   var idleFade = true
+  var idleOpacity = 0.6
+  var lastOpacity = 1      // applyOpacity 的去重基准，-1 表示尚未写入
+  // 忙碌判定（全局光标速度的滑动窗口，双阈值回滞）
+  var BUSY_WINDOW_MS = 2500
+  var BUSY_ON_PPS = 600    // 进入忙碌：窗口内平均速度 > 600 DIP px/s
+  var BUSY_OFF_PPS = 200   // 退出忙碌：< 200 DIP px/s
+  var cursorSamples = []   // {t, d} 滑动窗口样本
+  var lastCursorPt = null
+  var lastCursorAt = 0
+  var userBusy = false
+  // 悬停边界：鲸鱼图盒（气泡展开时并入气泡盒）向外扩张的矩形。
+  // 用全局光标判定，而不是窗口内的 pointermove —— 窗口矩形恰好把鲸鱼卡在右下角，
+  // 右边和下边**没有余量**，靠窗口事件从右侧靠近根本触发不到。全局光标判定不受
+  // 窗口矩形约束，四边余量对称；且它是纯几何，不捕获任何点击，天然穿透。
+  var BOUNDARY_MIN_PAD = 24    // CSS px 下限（小尺寸鲸鱼也要有可用余量）
+  var BOUNDARY_RATIO = 0.25    // 余量 = 鲸鱼宽 × 该比例，随缩放一起变
+  var inBoundary = false
+  var boundarySince = 0
+  // 驻留时间：高速掠过边界不该让鲸鱼闪一下 100%。「伸手去够鲸鱼」必然会在
+  // 边界里停留远超这个值，而工作时鼠标横穿 52px 的余量只要 ~26ms（按 2000px/s）——
+  // 180ms 把路过全部滤掉，对真实意图又完全无感。
+  var BOUNDARY_DWELL_MS = 180
+  var busyFade = true
+  var busyOpacity = 0.25
+  // 调试叠层：仅在 pet.html?debugBoundary=1 时创建，生产无开销
+  var DEBUG_BOUNDARY = /[?&]debugBoundary=1/.test(location.search)
+  var debugBox = null
+  // 眨眼：独立随机定时，与鼠标追踪互不干扰（两者叠加）。
+  // 3~9s、均值 6s ≈ 10 次/分。@keyframes 不能用（软件合成下 CSS 动画由动画帧驱动，
+  // 但这里要的是随机间隔，只能靠 setTimeout）。
+  var BLINK_MIN_MS = 3000
+  var BLINK_MAX_MS = 9000
+  var BLINK_SHUT_MS = 95       // 闭合时长；真人眨眼 100~150ms，取偏快一侧
+  var blinkTimer = null
+  var blinkShutTimer = null
+  var eyeFxOn = false
+  var EYE_FX_IMG = 'assets/DSniang1.png'   // 有配套闭眼帧的那张主图
+  var GAZE_BASE_IMG = 'assets/DSniang1-gaze-base.png'   // 同上，眼内已挖空的那张
+  // 朝光标倾斜：位移与转角都按 --wp-u 缩放，跟着鲸鱼大小一起变
+  var TILT_RANGE = 2.5     // 超出「2.5 倍半宽」视为不相关，归零
+  var TILT_MAX_X = 14      // 单位 --wp-u（= 源图一个像素，见 pet.css）
+  var TILT_MAX_Y = 6
+  var TILT_MAX_R = 2.2     // 度
+  var tiltX = 0, tiltY = 0, tiltR = 0
+  // 瞳孔跟随：与倾斜共用同一套几何量，但饱和得更快 —— 眼睛到 ~1.2 倍半宽就到边了，
+  // 再远也只是「一直看着那边」。上下刻意不对称：虹膜上移时会贴上睫毛、只在下方
+  // 留一道月牙，看着像阴影；下移则会在虹膜和睫毛之间裂开一条缝，像眼球掉下来了。
+  // 鲸鱼贴在屏幕右下角，光标绝大多数时候在它的上方，所以正好走空间充裕的那一侧。
+  var GAZE_RANGE = 1.2
+  var GAZE_MAX_X = 12      // 单位 --wp-u（= 源图一个像素）
+  var GAZE_MAX_UP = 15
+  var GAZE_MAX_DOWN = 3
+  var gazeX = 0, gazeY = 0
   var refreshIntervalMs = 60000
   var threshold = 10
   var alertImage = false
@@ -157,7 +231,8 @@
   var pressSound = ''
   var releaseSound = ''
   var customGroups = null
-  var currentImgSrc = ''
+  var currentImgSrc = ''    // 逻辑主图（用户选了哪张）：命中测试认这个
+  var currentShownSrc = ''  // img.src 实际是什么：开了眼部效果时是挖孔底图
   var lastPointerMoveAt = Date.now()
   var flipped = false
   // 显示器列表（{id, bounds, workArea}）：左右朝向判定与四角吸附都按「鲸鱼当前
@@ -356,6 +431,10 @@
     if (bubbleShown) return
     if (drag && drag.active) return
     if (state.status === 'error') return // 出错时不打扰
+    // 忙碌中不弹闲聊：此刻用户正在专心干活，气泡既挡内容又会被降透明度，
+    // 弹出来只有干扰。注意这里挡的是**闲聊**；余额变化/点击触发的 showBubble()
+    // 是用户主动或信息性的，不受此限。
+    if (userBusy) return
     if (bubbleTimer) { clearTimeout(bubbleTimer); bubbleTimer = null }
     if (gifFadeTimer) { clearTimeout(gifFadeTimer); gifFadeTimer = null }
     bubbleShown = true
@@ -364,6 +443,31 @@
     applyBubbleLines(bubbleRandomLines)
     bubbleBox.classList.add('wp-bubble-open')
     reportShape()
+    bubbleTimer = setTimeout(hideBubble, BUBBLE_MS)
+  }
+
+  // 主进程通知（如 Harness 启动结果）：直接弹一条自定义文案气泡。
+  // 这是对用户刚做的操作（点托盘菜单）的即时反馈，不走随机台词的守卫；
+  // 已有气泡展开时不打断，平滑换文案。
+  function showNotice(text) {
+    if (!bubbleOn) return
+    if (!text) return
+    var setContent = function () {
+      bubbleRandomActive = true
+      bubbleRandomLines = singleCenter('A', String(text), '', true)
+      applyBubbleLines(bubbleRandomLines)
+    }
+    if (bubbleShown) {
+      swapBubbleContent(setContent)
+    } else {
+      if (bubbleTimer) { clearTimeout(bubbleTimer); bubbleTimer = null }
+      if (gifFadeTimer) { clearTimeout(gifFadeTimer); gifFadeTimer = null }
+      bubbleShown = true
+      setContent()
+      bubbleBox.classList.add('wp-bubble-open')
+      reportShape()
+    }
+    if (bubbleTimer) { clearTimeout(bubbleTimer); bubbleTimer = null }
     bubbleTimer = setTimeout(hideBubble, BUBBLE_MS)
   }
 
@@ -488,11 +592,23 @@
   // 主图/预警图二选一：预警换图开启且余额低于阈值 → 预警图；否则主图
   function updateHeroImage() {
     var low = alertImage && isLowBalance()
-    var want = low ? resolveImgPath(alertImgPath) : resolveImgPath(mainImgPath)
-    if (want && want !== currentImgSrc) {
-      currentImgSrc = want
-      img.src = want
-      setupHitTest(want)
+    var logical = low ? resolveImgPath(alertImgPath) : resolveImgPath(mainImgPath)
+    // 先定下 eyeFxOn：它决定主图用原图还是用挖孔底图
+    applyEyeFx()
+    // 再定 Live2D 接管（依赖 eyeFxEnabled 与模型就绪状态）
+    applyL2D()
+    // 开了眼部效果就把主图换成「眼内挖空」的那张，让下面那层虹膜透出来；
+    // 关掉时必须换回原图，否则眼睛上是两个洞。
+    var shown = eyeFxOn ? resolveImgPath(GAZE_BASE_IMG) : logical
+    if (shown && shown !== currentShownSrc) {
+      currentShownSrc = shown
+      img.src = shown
+    }
+    // 命中测试始终按**逻辑主图**算：挖孔只在眼睛内部，alpha 包围盒两者完全一样，
+    // 但「用户选了哪张图」的权威是逻辑主图，不该被眼部效果的开合牵着重算。
+    if (logical && logical !== currentImgSrc) {
+      currentImgSrc = logical
+      setupHitTest(logical)
     }
     alertBadge.classList.toggle('wp-alert-badge-show', !!low)
   }
@@ -891,20 +1007,24 @@
   // 把像素级 alpha 段（610 空间）映射到窗口坐标并合并成矩形（纵向合并相邻
   // 行 x 范围相同的段，把上百条窄条压成少量矩形，供 setShape 使用）
   function maskRects() {
-    var im = img.offsetLeft, iw = img.offsetWidth, ih = img.offsetHeight
+    // 注意：x 与 y 的基准不同 —— 曾把 offsetLeft 同时当作 y 基准，只在窗口为
+    // 正方形（offsetLeft === offsetTop）时碰巧正确。窗口非正方形时整块 mask 会
+    // 整体纵向错位。Windows 下本函数是死代码（reportShape 提前返回），Linux/macOS
+    // 的 setShape 会踩到。
+    var ix = img.offsetLeft, iy = img.offsetTop, iw = img.offsetWidth, ih = img.offsetHeight
     if (!(iw > 0) || !(ih > 0) || !hitMask) return null
     var out = []
     var open = []
     for (var yS = 0; yS < 610; yS++) {
-      var y0 = im + Math.floor(yS * ih / 610)
-      var y1 = im + Math.floor((yS + 1) * ih / 610)
+      var y0 = iy + Math.floor(yS * ih / 610)
+      var y1 = iy + Math.floor((yS + 1) * ih / 610)
       if (y1 <= y0) y1 = y0 + 1
       var row = hitMask[yS]
       var xs = []
       if (row) {
         for (var k = 0; k < row.length; k += 2) {
-          var x0 = im + Math.floor(row[k] * iw / 610)
-          var x1 = im + Math.ceil(row[k + 1] * iw / 610)
+          var x0 = ix + Math.floor(row[k] * iw / 610)
+          var x1 = ix + Math.ceil(row[k + 1] * iw / 610)
           xs.push([x0, x1])
         }
       }
@@ -931,7 +1051,7 @@
     }
     for (var r = 0; r < open.length; r++) {
       var s2 = open[r]
-      out.push({ x: s2.x0, y: s2.y0, w: s2.x1 - s2.x0, h: im + ih - s2.y0 })
+      out.push({ x: s2.x0, y: s2.y0, w: s2.x1 - s2.x0, h: iy + ih - s2.y0 })
     }
     return out
   }
@@ -1068,6 +1188,7 @@
 
   function onDocPointerMove(e) {
     lastPointerMoveAt = Date.now()
+    applyOpacity() // 指针一动立刻恢复可见，不等 1.5s 轮询
     if (drag && drag.active) {
       // 拖拽中必须持续接收输入（指针捕获），绝不切回穿透
       applyIgnore(false)
@@ -1261,14 +1382,247 @@
     }
   }
 
-  // ------------------------------------------------------------- 闲置半透明
-  function checkIdle() {
-    if (!idleFade || (drag && drag.active)) {
-      root.classList.remove('wp-idle')
-      return
+  // --------------------------------------------------------- 不透明度单一漏斗
+  // 所有会改变可见度的条件都汇总到 decideOpacity()，输出一个目标值，再由
+  // applyOpacity() 写入 --wp-opacity。禁止在别处直接改透明度：多路输入各写
+  // 同一个属性必然互相覆盖。
+  // 优先级（自上而下，先命中先返回）：
+  //   拖拽中      → 1      正被操作，必须完全可见
+  //   边界内驻留  → 1      手伸过来了就要看清；必须压过「忙碌」，否则工作时
+  //                        鼠标一快鲸鱼就淡下去，根本没法瞄准点击
+  //   忙碌        → busyOpacity  鼠标高速移动 = 在工作，淡下去别挡内容
+  //   闲置        → idleOpacity  鼠标长时间没动
+  //   其余        → 1
+  function hoverActive() {
+    return inBoundary && Date.now() - boundarySince >= BOUNDARY_DWELL_MS
+  }
+
+  function decideOpacity() {
+    if (drag && drag.active) return 1
+    if (hoverActive()) return 1
+    if (busyFade && userBusy) return busyOpacity
+    if (idleFade && Date.now() - lastPointerMoveAt > IDLE_MS) return idleOpacity
+    return 1
+  }
+
+  function applyOpacity() {
+    var target = decideOpacity()
+    if (target === lastOpacity) return
+    // 变淡慢（.4s）、恢复快（.12s）——恢复慢会让「凑近看」有延迟感
+    root.classList.toggle('wp-op-fast', target > lastOpacity)
+    lastOpacity = target
+    root.style.setProperty('--wp-opacity', String(target))
+  }
+
+  // ------------------------------------------------------- 忙碌判定（光标速度）
+  // 数据源：主进程 20Hz 推送的全局光标坐标（窗口外的移动也算数）。
+  // 判定的是「一段时间内的平均速度」而不是瞬时速度 —— 单帧抖动不影响结果，
+  // 且人工作时鼠标是持续快速移动的，停下来思考时窗口自然滑出。
+  // 双阈值回滞：ON=600 进、OFF=200 出，避免在临界速度上反复横跳导致透明度闪烁。
+  // 本函数目前只维护 userBusy 与 .wp-busy 类（第 4 阶段才接进 decideOpacity）。
+  // ------------------------------------------------------------- 悬停边界
+  // 屏幕坐标系（DIP）下的边界矩形。窗口内布局 → 屏幕：加窗口原点。
+  // 窗口 bounds 由每拍 tick 现取，不用 state.posX/posY（主进程会自行移动窗口，
+  // 渲染进程缓存的位置在那些时刻是旧的）。鲸鱼盒用 getBoundingClientRect()：
+  // 它含镜像（flipped）结果。注意它也**包含** transform —— 鲸鱼的呼吸动画会让
+  // 这个矩形有 ~2px 的浮动（实测宽 209.7↔213.3），pad 因此在 52↔53 之间抖。
+  // 对一个悬停区来说这点抖动无关紧要，不值得为它改用 offset* 布局盒
+  // （offsetParent 不一定在视口原点，换算更易错）。
+  function boundaryRect(win) {
+    if (!win || typeof win.x !== 'number') return null
+    var r = img.getBoundingClientRect()
+    if (!r || r.width <= 0 || r.height <= 0) return null
+    var l = r.left, t = r.top, ri = r.right, b = r.bottom
+    // 气泡展开时并入：否则鼠标停在气泡上读字超过 3s 就会连气泡一起淡掉
+    if (bubbleShown) {
+      var bb = bubbleBox.getBoundingClientRect()
+      if (bb && bb.width > 0) {
+        l = Math.min(l, bb.left); t = Math.min(t, bb.top)
+        ri = Math.max(ri, bb.right); b = Math.max(b, bb.bottom)
+      }
     }
-    var idle = Date.now() - lastPointerMoveAt > IDLE_MS
-    root.classList.toggle('wp-idle', idle)
+    var pad = Math.max(BOUNDARY_MIN_PAD, r.width * BOUNDARY_RATIO)
+    return {
+      left: win.x + l - pad,
+      top: win.y + t - pad,
+      right: win.x + ri + pad,
+      bottom: win.y + b + pad,
+      pad: pad,
+    }
+  }
+
+  function updateBoundary(pt) {
+    var rect = boundaryRect(pt.win)
+    var hit = false
+    if (rect) hit = pt.x >= rect.left && pt.x <= rect.right && pt.y >= rect.top && pt.y <= rect.bottom
+    if (hit !== inBoundary) {
+      inBoundary = hit
+      boundarySince = Date.now() // 驻留计时从进入这一刻起算（见 BOUNDARY_DWELL_MS）
+      root.classList.toggle('wp-in-boundary', inBoundary)
+      console.log('[boundary] ' + (inBoundary ? '进入' : '离开') + ' 区')
+    }
+    if (DEBUG_BOUNDARY && rect) {
+      if (!debugBox) {
+        debugBox = document.createElement('div')
+        debugBox.style.cssText = 'position:fixed;border:2px dashed #ff2d55;pointer-events:none;z-index:2147483647;box-sizing:border-box'
+        document.body.appendChild(debugBox)
+      }
+      debugBox.style.left = (rect.left - pt.win.x) + 'px'
+      debugBox.style.top = (rect.top - pt.win.y) + 'px'
+      debugBox.style.width = (rect.right - rect.left) + 'px'
+      debugBox.style.height = (rect.bottom - rect.top) + 'px'
+      debugBox.textContent = 'pad ' + Math.round(rect.pad) + 'px'
+      debugBox.style.color = '#ff2d55'
+      debugBox.style.font = '12px monospace'
+    }
+  }
+
+  // ------------------------------------------------- 姿态：朝光标倾斜 + 瞳孔跟随
+  // 两件事共用同一套几何量（光标相对鲸鱼中心的方向），只是饱和半径不同：
+  // 整体倾斜满偏在 2.5 倍半宽处，瞳孔在 1.2 倍半宽处就到边了。
+  //
+  // 瞳孔跟随的机制见 pet.css：主图挖掉眼内、虹膜层压在下面平移，前缘被主图挡住、
+  // 后缘露出虹膜层自带的暗色延伸。这里只管把方向换算成 2 个位移量，不碰坐标 ——
+  // 硬编码的只有「哪张图配套哪张图」，眼型完全没有进入代码。
+  //
+  // 几何基准取 offsetLeft/offsetWidth（布局盒，**不含** transform），不能用
+  // getBoundingClientRect()：后者把倾斜本身算进去，20Hz 下会形成反馈环 —— 鲸鱼
+  // 因为倾斜移了位，位移又改变倾斜量，配合过渡动画就是低频抖动。布局盒恒定，
+  // 顺带也不受呼吸动画那 ~2px 浮动影响。
+  function updatePose(pt) {
+    var tx = 0, ty = 0, tr = 0, gx = 0, gy = 0
+    var gxn = 0, gyn = 0
+    if (!(drag && drag.active) && img.offsetWidth > 0) {
+      var hw = img.offsetWidth / 2, hh = img.offsetHeight / 2
+      var cx = pt.win.x + img.offsetLeft + hw
+      var cy = pt.win.y + img.offsetTop + hh
+      var clamp1 = function (v) { return v < -1 ? -1 : v > 1 ? 1 : v }
+      var nx = clamp1((pt.x - cx) / (hw * TILT_RANGE))
+      var ny = clamp1((pt.y - cy) / (hh * TILT_RANGE))
+      // .wp-root 在屏幕左半侧整体 scaleX(-1)，内部变换会跟着镜像，方向要反回来
+      if (root.classList.contains('wp-left')) nx = -nx
+      tx = nx * TILT_MAX_X
+      ty = ny * TILT_MAX_Y
+      tr = nx * TILT_MAX_R
+      // 瞳孔：同一套 dx/dy，只是换一个更小的饱和半径
+      gxn = clamp1((pt.x - cx) / (hw * GAZE_RANGE))
+      gyn = clamp1((pt.y - cy) / (hh * GAZE_RANGE))
+      if (root.classList.contains('wp-left')) gxn = -gxn
+      gx = gxn * GAZE_MAX_X
+      gy = gyn < 0 ? gyn * GAZE_MAX_UP : gyn * GAZE_MAX_DOWN
+      // Live2D 模型模式：整图倾斜=身体摇晃，不要 —— 倾斜量归零，
+      // 视线改用归一化方向直接驱动模型眼球（Y 轴屏幕向下、模型向上，取反）
+      if (l2dOn) { tx = 0; ty = 0; tr = 0 }
+    }
+    if (l2dOn && window.WhaleLive2D) WhaleLive2D.setGaze(gxn, -gyn)
+    if (tx === tiltX && ty === tiltY && tr === tiltR && gx === gazeX && gy === gazeY) return
+    tiltX = tx; tiltY = ty; tiltR = tr
+    gazeX = gx; gazeY = gy
+    root.style.setProperty('--wp-tilt-x', tx.toFixed(2))
+    root.style.setProperty('--wp-tilt-y', ty.toFixed(2))
+    root.style.setProperty('--wp-tilt-r', tr.toFixed(3))
+    root.style.setProperty('--wp-gaze-x', gx.toFixed(2))
+    root.style.setProperty('--wp-gaze-y', gy.toFixed(2))
+  }
+
+  // ------------------------------------------------------------------- 眨眼
+  // 闭眼帧是离线生成的同尺寸 PNG（assets/DSniang1-closed.png）：把两只眼盘整块填成
+  // 面部主肤色、保留上方那条深色睫毛带，底部残留的一道浅弧正好当闭眼睑褶。
+  // 自定义主图没有配套闭眼帧，硬套会露馅 —— 因此只在用内置默认图时启用。
+  function eyeFxEnabled() {
+    return mainImgPath === EYE_FX_IMG && !(alertImage && isLowBalance())
+  }
+
+  function scheduleBlink() {
+    if (blinkTimer) clearTimeout(blinkTimer)
+    blinkTimer = setTimeout(function () {
+      blinkTimer = null
+      if (!eyeFxOn) return scheduleBlink()
+      if (l2dOn && window.WhaleLive2D) WhaleLive2D.setBlink(true)
+      else lidImg.classList.add('wp-lid-on')
+      blinkShutTimer = setTimeout(function () {
+        blinkShutTimer = null
+        if (l2dOn && window.WhaleLive2D) WhaleLive2D.setBlink(false)
+        else lidImg.classList.remove('wp-lid-on')
+        scheduleBlink()
+      }, BLINK_SHUT_MS)
+    }, BLINK_MIN_MS + Math.random() * (BLINK_MAX_MS - BLINK_MIN_MS))
+  }
+
+  function applyEyeFx() {
+    var on = eyeFxEnabled()
+    if (on === eyeFxOn) return
+    eyeFxOn = on
+    root.classList.toggle('wp-eye-fx', on)
+    if (on) {
+      if (!blinkTimer) scheduleBlink()
+    } else {
+      if (blinkTimer) { clearTimeout(blinkTimer); blinkTimer = null }
+      if (blinkShutTimer) { clearTimeout(blinkShutTimer); blinkShutTimer = null }
+      lidImg.classList.remove('wp-lid-on')
+    }
+    console.log('[eyes] 眼部效果 ' + (on ? '启用' : '停用'))
+  }
+
+  // ------------------------------------------------------- Live2D 模型模式
+  // 模型模式接管的条件 = 眼部效果开启（用内置默认主图、非预警换图）+ 模型加载成功。
+  // 接管后：主图/虹膜层/闭眼帧隐形（CSS 的 .wp-l2d），眨眼与眼追转由模型做；
+  // 自定义主图、预警图仍走原来的 PNG 三件套（模型无法表达这些图）。
+  var l2dOn = false
+  function l2dWanted() {
+    return eyeFxEnabled() && !!(window.WhaleLive2D && WhaleLive2D.ready())
+  }
+  function applyL2D() {
+    var on = l2dWanted()
+    if (on === l2dOn) return
+    l2dOn = on
+    root.classList.toggle('wp-l2d', on)
+    if (window.WhaleLive2D) {
+      WhaleLive2D.setActive(on)
+      if (!on) WhaleLive2D.setBlink(false)
+    }
+    if (on) lidImg.classList.remove('wp-lid-on')
+    console.log('[l2d] 模型模式 ' + (on ? '启用' : '停用'))
+  }
+
+  function feedCursor(pt) {
+    if (!pt || typeof pt.x !== 'number' || typeof pt.y !== 'number') return
+    updateBoundary(pt)
+    updatePose(pt)
+    var now = Date.now()
+    // 轮询中断过（窗口隐藏/息屏恢复）→ 清空窗口，否则中断期间累积的位移
+    // 会被当成一次瞬移，把平均速度抬高到虚假的忙碌。
+    if (lastCursorAt && now - lastCursorAt > BUSY_WINDOW_MS) {
+      cursorSamples.length = 0
+      lastCursorPt = null
+    }
+    var d = 0
+    if (lastCursorPt) {
+      var dx = pt.x - lastCursorPt.x
+      var dy = pt.y - lastCursorPt.y
+      d = Math.sqrt(dx * dx + dy * dy)
+    }
+    lastCursorPt = { x: pt.x, y: pt.y }
+    lastCursorAt = now
+    cursorSamples.push({ t: now, d: d })
+    // 丢弃滑出窗口的样本
+    var cut = now - BUSY_WINDOW_MS
+    var drop = 0
+    while (drop < cursorSamples.length && cursorSamples[drop].t < cut) drop++
+    if (drop > 0) cursorSamples.splice(0, drop)
+    var sum = 0
+    for (var i = 0; i < cursorSamples.length; i++) sum += cursorSamples[i].d
+    var pps = sum / (BUSY_WINDOW_MS / 1000)
+    var was = userBusy
+    if (!userBusy && pps > BUSY_ON_PPS) userBusy = true
+    else if (userBusy && pps < BUSY_OFF_PPS) userBusy = false
+    if (userBusy !== was) {
+      root.classList.toggle('wp-busy', userBusy)
+      console.log('[busy] ' + (userBusy ? '进入' : '退出') + ' 忙碌 pps=' + Math.round(pps))
+    }
+    // 20Hz 重估：忙碌/边界都是在这里变化的，不重估就得等 1.5s 轮询，
+    // 边界驻留期满（180ms）也会被拖到下一次轮询才生效。target 不变时早返回。
+    applyOpacity()
   }
 
   // ------------------------------------------------------------- 配置应用
@@ -1286,8 +1640,11 @@
     }
     idleFade = c.idleFade !== false
     // 闲置不透明度（可调，0.2 - 1.0）
-    var idleOp = (typeof c.idleOpacity === 'number' && isFinite(c.idleOpacity)) ? Math.min(1, Math.max(0.2, c.idleOpacity)) : 0.6
-    root.style.setProperty('--wp-idle-opacity', String(idleOp))
+    idleOpacity = (typeof c.idleOpacity === 'number' && isFinite(c.idleOpacity)) ? Math.min(1, Math.max(0.2, c.idleOpacity)) : 0.6
+    // 忙碌降透明度（第 5 阶段接入配置与开关；配置里还没有这两个键时走这里的默认）
+    busyFade = c.busyFade !== false
+    busyOpacity = (typeof c.busyOpacity === 'number' && isFinite(c.busyOpacity)) ? Math.min(1, Math.max(0.05, c.busyOpacity)) : 0.25
+    applyOpacity() // 配置即改即生效，不等下一次轮询
     soundSet = c.soundSet === 'fx1' ? 'fx1' : 'duck'
     soundVol = typeof c.volume === 'number' ? c.volume : 0.8
     soundOn = soundVol > 0
@@ -1318,9 +1675,11 @@
   }
 
   // ------------------------------------------------------------- 外部事件
+  api.onCursorTick(feedCursor)
   api.onConfigChanged(function (c) { applyConfig(c, false) })
   api.onCustomChanged(function (data) { applyCustom(data) })
   api.onRefresh(function () { refresh(true) })
+  api.onNotice(function (text) { showNotice(text) })
 
   // ------------------------------------------------------------- 启动
   async function init() {
@@ -1337,13 +1696,19 @@
     await api.resizeWindow(state.winW, state.winH)
     await initPosition()
     await applyConfig(c, true)
+    // Live2D 模型：异步加载（失败或不支持时静默保持 PNG 三件套）
+    if (window.WhaleLive2D) {
+      WhaleLive2D.init(api, breath, alertBadge).then(function (ok) {
+        if (ok) updateHeroImage()
+      })
+    }
     setupHitTest()
     reportShape() // 非 Windows：按鲸鱼像素轮廓裁剪窗口（透明区域点击穿透）
     applyIgnore(true) // Windows：初始默认穿透，随鼠标悬停交互区自动切换
     api.getCustom().then(applyCustom).catch(function () {})
     refresh(false)
     refreshTimer = setInterval(function () { refresh(false) }, refreshIntervalMs)
-    idleCheckTimer = setInterval(checkIdle, 1500)
+    opacityTimer = setInterval(applyOpacity, 1500)
   }
   init().catch(function (err) { console.error('[whale-pet] init failed', err) })
 })()

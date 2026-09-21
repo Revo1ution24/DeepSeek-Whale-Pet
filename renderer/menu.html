@@ -129,7 +129,22 @@
           <input id="wm-idle-opacity" class="wm-range" type="range" min="0.2" max="1" step="0.05">
           <span id="wm-idle-opacity-v" class="wm-val"></span>
         </div>
-        <div class="wm-note wm-note-muted">气泡：点击鲸鱼时弹出；闲置：鼠标离开 3 秒后渐隐。</div>
+        <div class="wm-grid-2">
+          <div class="wm-field">
+            <span class="wm-label">忙碌半透明</span>
+            <input id="wm-busyfade" type="checkbox" title="鼠标高速移动（判定为工作中）时鲸鱼变淡，不遮挡内容">
+          </div>
+          <div class="wm-field">
+            <span class="wm-label">鼠标悬停</span>
+            <span class="wm-val" style="opacity:.75">自动恢复 100%</span>
+          </div>
+        </div>
+        <div class="wm-field">
+          <span class="wm-label">忙碌不透明度</span>
+          <input id="wm-busy-opacity" class="wm-range" type="range" min="0.05" max="1" step="0.05">
+          <span id="wm-busy-opacity-v" class="wm-val"></span>
+        </div>
+        <div class="wm-note wm-note-muted">气泡：点击鲸鱼时弹出；闲置：鼠标离开 3 秒后渐隐；忙碌：鼠标快速移动时变淡。鼠标移入鲸鱼四周的边界（或点中鲸鱼）即恢复 100%。</div>
       </div>
 
       <div class="wm-group">

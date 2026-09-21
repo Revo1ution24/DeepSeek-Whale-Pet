@@ -19,6 +19,7 @@
     usage: $('wm-usage'), refresh: $('wm-refresh'), threshold: $('wm-threshold'), autostart: $('wm-autostart'),
     bubble: $('wm-bubble'), bubbleInterval: $('wm-bubble-interval'), idleFade: $('wm-idlefade'),
     idleOpacity: $('wm-idle-opacity'), idleOpacityV: $('wm-idle-opacity-v'),
+    busyFade: $('wm-busyfade'), busyOpacity: $('wm-busy-opacity'), busyOpacityV: $('wm-busy-opacity-v'),
     scale: $('wm-scale'), scaleV: $('wm-scale-v'),
     peak: $('wm-peak'), peakText: $('wm-peaktext'), peakOff: $('wm-peak-off'), peakOn: $('wm-peak-on'),
     textOk: $('wm-text-ok'), textLow: $('wm-text-low'),
@@ -99,6 +100,9 @@
     els.idleFade.checked = cfg.idleFade !== false
     els.idleOpacity.value = String(cfg.idleOpacity != null ? cfg.idleOpacity : 0.6)
     els.idleOpacityV.textContent = Math.round((cfg.idleOpacity != null ? cfg.idleOpacity : 0.6) * 100) + '%'
+    els.busyFade.checked = cfg.busyFade !== false
+    els.busyOpacity.value = String(cfg.busyOpacity != null ? cfg.busyOpacity : 0.25)
+    els.busyOpacityV.textContent = Math.round((cfg.busyOpacity != null ? cfg.busyOpacity : 0.25) * 100) + '%'
     els.scale.value = String(cfg.scale || 1)
     els.scaleV.textContent = (cfg.scale || 1).toFixed(1)
     els.peak.value = cfg.peakMode || 'default'
@@ -189,6 +193,7 @@
   els.peakText.addEventListener('change', function () { api.setConfig({ peakText: els.peakText.checked }) })
   els.bubble.addEventListener('change', function () { api.setConfig({ bubbleOn: els.bubble.checked }) })
   els.idleFade.addEventListener('change', function () { api.setConfig({ idleFade: els.idleFade.checked }) })
+  els.busyFade.addEventListener('change', function () { api.setConfig({ busyFade: els.busyFade.checked }) })
   els.autostart.addEventListener('change', function () { api.setConfig({ autostart: els.autostart.checked }) })
   els.alertImage.addEventListener('change', function () { api.setConfig({ alertImage: els.alertImage.checked }) })
 
@@ -204,6 +209,10 @@
   els.idleOpacity.addEventListener('input', function () {
     els.idleOpacityV.textContent = Math.round(Number(els.idleOpacity.value) * 100) + '%'
     debounceSave({ idleOpacity: Number(els.idleOpacity.value) }, 200)
+  })
+  els.busyOpacity.addEventListener('input', function () {
+    els.busyOpacityV.textContent = Math.round(Number(els.busyOpacity.value) * 100) + '%'
+    debounceSave({ busyOpacity: Number(els.busyOpacity.value) }, 200)
   })
 
   // ---------- 数字输入 ----------

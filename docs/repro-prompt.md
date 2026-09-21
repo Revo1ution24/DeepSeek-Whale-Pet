@@ -45,7 +45,15 @@
 - **点击穿透**：不用 OS 级 `setIgnoreMouseEvents`（Linux/XWayland 不可靠、会丢点击），而是整窗接收事件 + 主进程 `win.setShape(rects)` 把窗口裁剪成「鲸鱼 + 气泡 + 菜单按钮」矩形，其余区域点击自然落到桌面。形状 = 渲染进程布局盒（offset*/width/height，padding 10px，镜像时水平翻转），每次换图/开关气泡/缩放后重新上报。
 - **命中测试**：`isWhaleHit` 用 610×610 探针画布（`hitCanvas.getImageData` alpha > 10）；探针重载期间放宽为全命中，保证可点击。镜像（鲸鱼在屏幕左半 → 水平翻转）时坐标 `lx = 610 - lx` 反转。
 - 气泡：SVG 云朵 + 文本三行（label/amount/hint）+ 动图；`BUBBLE_MS 5000` 自动关闭；点击鲸鱼弹气泡；`wm-bubble-interval` 为随机台词自动弹出间隔（0=关闭，默认 120s）。
-- 闲置半透明：鼠标离开 3s 后加 `wp-idle` class（opacity 由 `cfg.idleOpacity` 控制，0.2–1.0），拖动/按钮悬浮时移除。
+- 不透明度**单一漏斗**：所有淡化条件汇总到 `decideOpacity()`，由 `applyOpacity()` 写入 `--wp-opacity`，作用于整棵 `.wp-root`（`opacity` 会在父元素形成合成组，子元素无法突破其上限 —— 需要豁免的元素必须移出 `.wp-root`）。优先级自上而下：拖拽中 → 1；边界内驻留 ≥180ms → 1；忙碌 → `cfg.busyOpacity`（默认 0.25）；闲置（指针 3s 未动）→ `cfg.idleOpacity`（默认 0.6，0.2–1.0）；否则 1。变淡 `.4s`、恢复 `.12s`（`wp-op-fast`）。**边界必须压过忙碌**，否则工作时鼠标一快鲸鱼就淡下去、没法瞄准点击。禁止在别处直接改透明度。
+- **全局光标轮询**：主进程 20Hz `screen.getCursorScreenPoint()` → `cursor:tick`。渲染进程只能拿到窗口内指针事件（`setIgnoreMouseEvents(forward)` 转发），窗口外的全局位置**只能**由主进程提供。`preload` 暴露 `onCursorTick(cb)`。
+- **忙碌判定** `feedCursor(pt)`：2.5s 滑动窗口的光标**平均速度**（不是瞬时速度），双阈值回滞 `>600` DIP px/s 进入 / `<200` 退出（避免临界速度反复横跳导致透明度闪烁）。轮询中断超过一个窗口宽就清空样本 —— 否则中断期间累积的位移会被当成一次瞬移。写 `.wp-busy` 类并交给 `decideOpacity()` 取用。
+- **悬停边界** `boundaryRect()`：鲸鱼图盒外扩 `max(24px, 宽×0.25)`，气泡展开时并入气泡盒。**必须用全局光标判定**，不能用窗口内 pointermove —— 窗口把鲸鱼卡在右下角，右/下没有余量。边界是纯几何，不注册任何事件，**穿透是免费的**（`setIgnoreMouseEvents(forward)` 本来就只转发 move 不吞点击）。窗口 bounds 由 tick 现取，不用 `state.posX/posY`（主进程会自行移动窗口）。`?debugBoundary=1` 开虚线叠层。
+- **眨眼**：独立随机定时 3–9s（均值 6s ≈ 10 次/分），与鼠标追踪互不干扰、两者叠加。闭眼帧 `assets/DSniang1-closed.png` 与主图同尺寸，**离线生成**（把两只眼盘整块填成面部主肤色、保留上方深色睫毛带，底部残留的一道浅弧正好当闭眼睑褶）。渲染是叠一层 `.wp-img-lid` 做 opacity 切换（`.06s`），闭合 95ms。**只在 `mainImgPath === 'assets/DSniang1.png'` 且未在显示预警图时启用**（`eyeFxEnabled()`）—— 自定义图没有配套闭眼帧，硬套会把 DSniang1 的闭眼帧叠到用户图上，整只角色闪一下变脸。
+- **朝光标倾斜** `updatePose()`：20Hz 全局光标 → 写 `--wp-tilt-{x,y,r}` → `.wp-img` 做 `translate + rotate`（轴在底边中点）。位移以 `--wp-u` 为单位随缩放联动（`--wp-u = base/1026` 恰好等于**源图一个像素**，因为图片宽 0.5945×base、源图 610px），满偏 = 鲸鱼半宽 ×2.5（约 ±14u / ±2.2°），超出归零；`.wp-left` 镜像时 x 分量取反。过渡 `.18s` 把 20Hz 离散采样抹成连续运动。几何基准必须用 `offsetLeft/offsetWidth`（布局盒，**不含 transform**）—— 用 `getBoundingClientRect()` 会把倾斜本身算进输入，20Hz 下形成反馈环而低频抖动。
+- **瞳孔跟随**：同一套几何量（`--wp-gaze-{x,y}`），饱和半径缩到 1.2 倍半宽（约 ±12u 横向 / 上 15u / 下 3u）。**上下必须不对称**：虹膜上移会贴上睫毛（上方本来就没空隙）、只在下方留一道月牙，读作眼窝阴影；下移会在虹膜和睫毛之间裂开一条缝，像眼球掉下来。鲸鱼贴屏幕右下角，光标多数时候在上方，走的正是空间充裕那一侧。
+- **眼睛追踪的三层合成**（关键：**不要**用 clip-path / mask / 扩展虹膜）：虹膜铺满整只眼、没有巩膜，直接移动瞳孔会露出皮肤。解法是普通 alpha 叠三层，自下而上 —— ① `assets/DSniang1-gaze-iris.png` 整张透明只有两个眼盘 + 一圈向外渐暗到描边色 `#3D4774` 的延伸，**会平移**；② `assets/DSniang1-gaze-base.png` 原图把眼盘内部挖空、其余原样，**不动**；③ 闭眼帧。虹膜前缘滑进底图的不透明区被挡掉，后缘让出的空档露出自己的暗色延伸 → 读作眼窝内阴影。**可动范围不受眼眶粗细限制**，代码完全不知道眼型（右眼那条刘海只是底图的一部分，零特殊处理）。素材由 `whale-makegaze.mjs` 用 BFS 距离场生成；静止态**必须**与原图逐像素相同 —— 挖孔只吃严格判据命中的虹膜像素，抗锯齿边缘留在底图里盖住虹膜层边缘。
+- **眼部效果总开关** `eyeFxEnabled()`：内置默认主图 + 未显示预警图。关闭时虹膜层整层 `display:none`（`.wp-root:not(.wp-eye-fx)`）且主图换回原图 —— 不能只靠「主图不透明处会盖住它」，自定义图的透明区域会漏。
 - 按压动画：`scaleY(0.88) scaleX(1.05)` 挤压，松手回弹；按压/松手音效（内置音效集或用户自定义 mp3/wav/ogg）。
 - 低余额：`totalBalance < cfg.lowBalanceThreshold`（默认 5 元）→ 气泡换「余额预警」文案 + 颜色切换（默认 `#e0433f`），开启 `alertImage` 时切换预警图；主进程 30 分钟节流弹系统通知。
 
@@ -147,6 +155,10 @@ Electron 中这三者**全部是 DIP 坐标**，无需任何换算：
 - `npm test`（`node test/unit.test.js`，纯 Node）：峰谷边界、`priceFor` 匹配/默认、`pickBalanceInfo` 优先级、token 换算、`fetchBalance` 重试/4xx/超时瞬态、记账观察/充值不扣减/跨天归档、配置消毒/0600/环境变量覆盖、预警换图/路径/主题/20 字符截断。
 - `npm run smoke`（`electron . --smoke-test`）：真实启动 → 截图 pet 窗口 → 注入点击验证气泡 → **合成 pointer 事件链验证拖拽**（movementX 单调性防抽搐、连续拖到 workArea 上边缘 reached=true）→ 无 Key 返回 NO_KEY、坏 Key 返回 HTTP 401 → 20s 兜底退出。
 - 手测清单：拖拽**必须**能贴回四边（尤其缩放 125–150% 下从左下角拖到中心再拖回）；点击非鲸鱼区域穿透；重启后位置记忆；托盘/热键/自启。
+- **用 CDP 做像素级验证时的三个坑**（都实际踩过，各浪费过一轮）：
+  1. `.wp-img` 现在有三个元素（虹膜层 / 主图 / 闭眼帧），且**虹膜层在 DOM 里排最前** —— 裸 `querySelector('.wp-img')` 选到的是它。主图要写 `.wp-img:not(.wp-img-gaze):not(.wp-img-lid)`。
+  2. 停掉呼吸动画只能用 **CSSOM**（`br.style.animation='none'`）。注入 `<style>` 元素在 CSP `default-src file:` 下会被整条丢弃 —— `document.styleSheets` 里查得到这张表，规则却一条不生效，很容易误判成「已停」。
+  3. 呼吸动画是**缩放**（`matrix(1.0x)`）不是平移，且一直在动，因此「截图 ↔ 源图按下采样比对」信噪比极差：Chromium 的滤波与自写盒式滤波在亚像素错位下必然分歧，阈值附近的像素每轮随机翻面（同一份代码跑出 1.95% / 9.36% / 4.46%，最大偏差却始终是同一点）。**改成同管线对照** —— 让同一个渲染器再画一遍关掉眼部效果的同一张图，两次实拍互比，滤波/亚像素/缩放全部相同，静止态实测差异 **0 px**。
 
 ## 12. 复现完成标准
 
